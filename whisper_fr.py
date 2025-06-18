@@ -1,18 +1,35 @@
-from transformers import WhisperProcessor, WhisperForConditionalGeneration, Seq2SeqTrainer, Seq2SeqTrainingArguments
+from transformers import WhisperProcessor, Seq2SeqTrainer, Seq2SeqTrainingArguments, WhisperForConditionalGeneration
 import os
+import gc
 import torch
 import torchaudio
+import evaluate
 
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+if device == torch.device("cuda"):
+    print("Using GPU")
+    exit(0)
+else:
+    print("Using CPU")
+    exit(0)
+
+torchaudio.set_audio_backend("soundfile")
+
+import numpy as np
 # Set the environment variable
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
 # Clear GPU cache
 torch.cuda.empty_cache()
+gc.collect()
 
 # Set the directory where your dataset is located
 train_dir = "train-clean-100"
 dev_dir = "dev-clean"
 test_dir = "test-clean"
+
 
 # Load your local LibriSpeech dataset using torchaudio
 train_set = torchaudio.datasets.LIBRISPEECH(train_dir, url="train-clean-100")
@@ -55,10 +72,16 @@ class LibriSpeechPreprocessed(torch.utils.data.Dataset):
         example = self.dataset[idx]
         return preprocess_function(example)
 
+
+# Slice data to test on a smaller dataset size
+subset_train_set = torch.utils.data.Subset(train_set, indices=range(2000))
+subset_dev_set = torch.utils.data.Subset(dev_set, indices=range(200))
+subset_test_set = torch.utils.data.Subset(test_set, indices=range(200))
+
 # Apply the preprocessing to the dataset
-processed_trainset = LibriSpeechPreprocessed(train_set)
-processed_devset = LibriSpeechPreprocessed(dev_set)
-processed_testset = LibriSpeechPreprocessed(test_set)
+processed_trainset = LibriSpeechPreprocessed(subset_train_set)
+processed_devset = LibriSpeechPreprocessed(subset_dev_set)
+processed_testset = LibriSpeechPreprocessed(subset_test_set)
 
 # Load the Whisper model
 model = WhisperForConditionalGeneration.from_pretrained(model_name)
@@ -78,11 +101,11 @@ def custom_data_collator(batch):
 training_args = Seq2SeqTrainingArguments(
     output_dir="./results",
     eval_strategy="epoch",
-    per_device_train_batch_size=1,   # Adjust batch size based on available memory
-    per_device_eval_batch_size=1,    # Adjust batch size based on available memory
+    per_device_train_batch_size=1,
+    per_device_eval_batch_size=1,
     gradient_accumulation_steps=2,   # Optional: for simulating larger batch sizes
     fp16=True,                       # Enable mixed precision training
-    num_train_epochs=3,
+    num_train_epochs=2,
     logging_dir="./logs",
     logging_steps=10,
     save_steps=500,
@@ -107,3 +130,42 @@ trainer.train()
 # Save the fine-tuned model and processor
 model.save_pretrained("./whisper_finetuned_model")
 processor.save_pretrained("./whisper_finetuned_processor")
+
+
+### EVALUATE ON TEST SET ###
+# Define a function to compute metrics for evaluation
+def compute_metrics(pred):
+    wer_metric = evaluate.load("wer")
+    pred_ids = pred.predictions
+    label_ids = pred.label_ids
+
+    # Decode the predictions and labels to text
+    pred_str = processor.tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
+
+    # Compute Word Error Rate (WER) using Hugging Face WER metric
+    label_ids[label_ids == -100] = processor.tokenizer.pad_token_id
+    label_str = processor.tokenizer.batch_decode(label_ids, skip_special_tokens=True)
+
+    return {"wer": wer_metric.compute(predictions=pred_str, references=label_str)}
+
+
+# Initialize a new trainer for evaluation with compute_metrics function
+eval_trainer = Seq2SeqTrainer(
+    model=model,
+    args=training_args,
+    eval_dataset=processed_testset,
+    tokenizer=processor.tokenizer,
+    data_collator=custom_data_collator,
+    compute_metrics=compute_metrics
+)
+
+# Empty memory again before evaluation
+torch.cuda.empty_cache()
+gc.collect()
+
+
+# Run evaluation on the test set
+results = eval_trainer.evaluate()
+
+# Print evaluation results
+print(f"Test Set Results: {results}")
