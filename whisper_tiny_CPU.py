@@ -1,11 +1,10 @@
-from transformers import WhisperProcessor, Seq2SeqTrainer, Seq2SeqTrainingArguments, WhisperForConditionalGeneration, DataCollatorForSeq2Seq
+from transformers import WhisperProcessor, Seq2SeqTrainer, Seq2SeqTrainingArguments, WhisperForConditionalGeneration
 import os
 import gc
 import torch
 import torchaudio
 import evaluate
-from typing import Any, Dict, List, Union
-from dataclasses import dataclass
+
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -16,7 +15,6 @@ else:
 
 torchaudio.set_audio_backend("soundfile")
 
-import numpy as np
 # Set the environment variable
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
@@ -38,6 +36,16 @@ test_set = torchaudio.datasets.LIBRISPEECH(test_dir, url="test-clean")
 model_name = "openai/whisper-tiny.en"
 processor = WhisperProcessor.from_pretrained(model_name)
 
+# Clear GPU cache
+torch.cuda.empty_cache()
+gc.collect()
+
+torch.backends.cudnn.benchmark = False
+torch.backends.cudnn.deterministic = True
+
+# Clear cache more frequently
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:128'
+
 # Preprocess function for each example
 def preprocess_function(example):
     waveform, sample_rate, utterance, speaker_id, chapter_id, utterance_id = example
@@ -48,17 +56,15 @@ def preprocess_function(example):
         waveform = torch.mean(waveform, dim=0, keepdim=True)
 
     # Preprocess the input (audio) for Whisper, ensuring correct shape
-    inputs = processor.feature_extractor(waveform.squeeze(0), sampling_rate=sample_rate, return_tensors="pt").input_features
+    inputs = torch.tensor(processor.feature_extractor(waveform.squeeze(0), sampling_rate=sample_rate).input_features)
 
     # Tokenize the target (transcript/utterance) for Whisper
-    labels = processor.tokenizer(utterance, return_tensors="pt").input_ids
-    labels = labels.squeeze(0)
+    labels = processor.tokenizer(utterance).input_ids
 
     return {
-        "input_features": inputs.squeeze(0),  # Remove extra batch dimension
-        "labels": torch.tensor(labels)
+        "input_features": inputs.squeeze(0).to(device),  # Remove extra batch dimension
+        "labels": torch.tensor(labels).to(device),
     }
-
 
 # Define a custom PyTorch dataset class to preprocess the data
 class LibriSpeechPreprocessed(torch.utils.data.Dataset):
@@ -86,67 +92,55 @@ processed_testset = LibriSpeechPreprocessed(subset_test_set)
 # Load the Whisper model
 model = WhisperForConditionalGeneration.from_pretrained(model_name)
 
-# Disable cache
-model.config.use_cache = False
+model.get_encoder().requires_grad_(False)
 
-# Enable gradient checkpointing to save memory
-model.gradient_checkpointing_enable()
+model = model.to(device)
+
+# Clear GPU cache
+torch.cuda.empty_cache()
+gc.collect()
+
+torch.backends.cudnn.benchmark = False
+torch.backends.cudnn.deterministic = True
+
+# Clear cache more frequently
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:128'
 
 # Define a data collator
 def custom_data_collator(batch):
-    # Stack the input features and labels into tensors
-    input_features = torch.stack([item["input_features"] for item in batch])
-    labels = torch.stack([item["labels"] for item in batch])
+    try:
+        # Stack the input features and labels into tensors
+        input_features = torch.stack([item["input_features"] for item in batch])
+        labels = torch.stack([item["labels"] for item in batch])
 
-    return {
-        "input_features": input_features,
-        "labels": labels
-    }
+        return {
+            "input_features": input_features.to(device),
+            "labels": labels.to(device)
+        }
+    except RuntimeError as e:
+        if "out of memory" in str(e):
+            torch.cuda.empty_cache()
+            gc.collect()
+            raise e
+        else:
+            raise e
 
-@dataclass
-class DataCollatorSpeechSeq2SeqWithPadding:
-    processor: Any
-
-    def __call__(self, features: List[Dict[str, Union[List[int], torch.Tensor]]]) -> Dict[str, torch.Tensor]:
-        # split inputs and labels since they have to be of different lengths and need different padding methods
-        # first treat the audio inputs by simply returning torch tensors
-        input_features = [{"input_features": feature["input_features"].clone().detach()} for feature in features]
-        batch = self.processor.feature_extractor.pad(input_features, return_tensors="pt")
-
-        # get the tokenized label sequences
-        label_features = [{"input_ids": feature["labels"].clone().detach()} for feature in features]
-        # pad the labels to max length
-        labels_batch = self.processor.tokenizer.pad(label_features, return_tensors="pt")
-
-        # replace padding with -100 to ignore loss correctly
-        labels = labels_batch["input_ids"].masked_fill(labels_batch.attention_mask.ne(1), -100)
-
-        # if bos token is appended in previous tokenization step,
-        # cut bos token here as it's append later anyways
-        if (labels[:, 0] == self.processor.tokenizer.bos_token_id).all().cpu().item():
-            labels = labels[:, 1:]
-
-        batch["labels"] = labels
-
-        return batch
-
-# Data collator
-data_collator = DataCollatorSpeechSeq2SeqWithPadding(
-    processor = processor,
-)
 
 # Define training arguments
 training_args = Seq2SeqTrainingArguments(
     output_dir="./results",
     eval_strategy="epoch",
+    dataloader_pin_memory=False,   # Only CPU tensors can be pinned and we are using GPU tensors
     per_device_train_batch_size=1,
     per_device_eval_batch_size=1,
     gradient_accumulation_steps=2,   # Optional: for simulating larger batch sizes
-    fp16=True,                       # Enable mixed precision training
+    fp16=False,                       # Enable mixed precision training
     num_train_epochs=2,
     logging_dir="./logs",
     logging_steps=10,
     save_steps=500,
+    gradient_checkpointing=True,  # Enable gradient checkpointing to save memory
+    max_grad_norm=1.0,  #
 )
 
 # Initialize the trainer with the datasets (not DataLoaders)
@@ -155,9 +149,18 @@ trainer = Seq2SeqTrainer(
     args=training_args,
     train_dataset=processed_trainset,  # Passing preprocessed dataset, not DataLoader
     eval_dataset=processed_devset,     # Same for eval dataset
-    tokenizer=processor.tokenizer,     # Using the processor's tokenizer
-    data_collator=data_collator,
+    processing_class=processor,     # Using the processor's tokenizer
+    data_collator=custom_data_collator,
 )
+
+# Enable gradient checkpointing to save memory
+model.gradient_checkpointing_enable()
+
+torch.backends.cudnn.benchmark = False
+torch.backends.cudnn.deterministic = True
+
+# Clear cache more frequently
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:128'
 
 # Start fine-tuning the model
 trainer.train()
@@ -189,8 +192,8 @@ eval_trainer = Seq2SeqTrainer(
     model=model,
     args=training_args,
     eval_dataset=processed_testset,
-    tokenizer=processor.tokenizer,
-    data_collator=data_collator,
+    processing_class=processor,
+    data_collator=custom_data_collator,
     compute_metrics=compute_metrics
 )
 

@@ -1,6 +1,5 @@
 flask
 transformers
-os
 torch
 torchaudio
 evaluate
