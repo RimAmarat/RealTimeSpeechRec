@@ -30,9 +30,9 @@ dev_dir = "dev-clean"
 test_dir = "test-clean"
 
 # Load your local LibriSpeech dataset using torchaudio
-train_set = torchaudio.datasets.LIBRISPEECH(train_dir, url="train-clean-100")
-dev_set = torchaudio.datasets.LIBRISPEECH(dev_dir, url="dev-clean")
-test_set = torchaudio.datasets.LIBRISPEECH(test_dir, url="test-clean")
+train_set = torchaudio.datasets.LIBRISPEECH(train_dir, url="train-clean-100", download=True)
+dev_set = torchaudio.datasets.LIBRISPEECH(dev_dir, url="dev-clean", download=True)
+test_set = torchaudio.datasets.LIBRISPEECH(test_dir, url="test-clean", download=True)
 
 # Initialize the processor
 model_name = "openai/whisper-tiny.en"
